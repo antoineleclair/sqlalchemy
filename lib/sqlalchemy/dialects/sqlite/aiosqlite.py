@@ -164,6 +164,7 @@ class AsyncAdapt_aiosqlite_cursor:
     )
 
     server_side = False
+    lastrowid: int
 
     def __init__(self, adapt_connection: AsyncAdapt_aiosqlite_connection):
         self._adapt_connection = adapt_connection
@@ -186,8 +187,9 @@ class AsyncAdapt_aiosqlite_cursor:
         parameters: Optional[_DBAPISingleExecuteParams] = None,
     ) -> Any:
 
+        _cursor: Optional[AsyncIODBAPICursor] = None
         try:
-            _cursor: AsyncIODBAPICursor = self.await_(self._connection.cursor())  # type: ignore[arg-type] # noqa: E501
+            _cursor = self.await_(self._connection.cursor())  # type: ignore[arg-type] # noqa: E501
 
             if parameters is None:
                 self.await_(_cursor.execute(operation))
@@ -208,17 +210,22 @@ class AsyncAdapt_aiosqlite_cursor:
             if not self.server_side:
                 self.await_(_cursor.close())
             else:
-                self._cursor = _cursor  # type: ignore[misc]
+                self._cursor = _cursor
         except Exception as error:
             self._adapt_connection._handle_exception(error)
+        except BaseException:
+            if _cursor is not None:
+                self._close_interrupted(_cursor)
+            raise
 
     def executemany(
         self,
         operation: Any,
         seq_of_parameters: _DBAPIMultiExecuteParams,
     ) -> Any:
+        _cursor: Optional[AsyncIODBAPICursor] = None
         try:
-            _cursor: AsyncIODBAPICursor = self.await_(self._connection.cursor())  # type: ignore[arg-type] # noqa: E501
+            _cursor = self.await_(self._connection.cursor())  # type: ignore[arg-type] # noqa: E501
             self.await_(_cursor.executemany(operation, seq_of_parameters))
             self.description = None
             self.lastrowid = _cursor.lastrowid
@@ -226,6 +233,30 @@ class AsyncAdapt_aiosqlite_cursor:
             self.await_(_cursor.close())
         except Exception as error:
             self._adapt_connection._handle_exception(error)
+        except BaseException:
+            if _cursor is not None:
+                self._close_interrupted(_cursor)
+            raise
+
+    def _close_interrupted(self, cursor: AsyncIODBAPICursor) -> None:
+        """Close the driver cursor of a statement that a cancellation
+        interrupted.
+
+        The engine invalidates the connection for an exit exception
+        without closing the cursor, and the cursor object outlives the
+        connection through the traceback of the cancelled task.  A SELECT
+        left this way keeps a read lock on the database until the cursor
+        is garbage collected.  The close is shielded so that a further
+        cancellation does not leave it undone.
+
+        """
+
+        try:
+            self.await_(asyncio.shield(cursor.close()))
+        except Exception:
+            # the caller gets the cancellation; an error closing the
+            # cursor is not reported in its place
+            pass
 
     def setinputsizes(self, *inputsizes: Any) -> None:
         pass
