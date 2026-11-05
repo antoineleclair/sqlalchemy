@@ -256,6 +256,9 @@ class AsyncAdapt_dbapi_cursor:
             return await_(self._execute_async(operation, parameters))
         except Exception as error:
             self._adapt_connection._handle_exception(error)
+        except BaseException:
+            self._close_interrupted()
+            raise
 
     def executemany(
         self,
@@ -268,6 +271,35 @@ class AsyncAdapt_dbapi_cursor:
             )
         except Exception as error:
             self._adapt_connection._handle_exception(error)
+        except BaseException:
+            self._close_interrupted()
+            raise
+
+    def _close_interrupted(self) -> None:
+        """Close the driver cursor of a statement that a cancellation
+        interrupted.
+
+        The engine invalidates the connection for an exit exception
+        without closing the cursor, and the cursor object outlives the
+        connection through the traceback of the cancelled task.  With
+        aiosqlite, a SELECT left this way keeps a read lock on the database
+        until the cursor is garbage collected.  The close is shielded so
+        that a further cancellation does not leave it undone.
+
+        """
+
+        if self._cursor is None:
+            return
+
+        try:
+            if not self._awaitable_cursor_close:
+                self._cursor.close()  # type: ignore[unused-coroutine]
+            else:
+                await_(asyncio.shield(self._cursor.close()))
+        except Exception:
+            # the caller gets the cancellation; an error closing the
+            # cursor is not reported in its place
+            pass
 
     async def _execute_async(
         self, operation: Any, parameters: Optional[_DBAPISingleExecuteParams]

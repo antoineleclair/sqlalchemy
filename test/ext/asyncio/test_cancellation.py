@@ -14,6 +14,7 @@ import asyncio
 from sqlalchemy import event
 from sqlalchemy import select
 from sqlalchemy import testing
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.ext.asyncio.base import _run_to_completion
 from sqlalchemy.pool import AsyncAdaptedQueuePool
@@ -54,6 +55,16 @@ async def _connect_execute_except_exception(async_engine):
             await conn.execute(select(1))
     except Exception:
         pass
+
+
+async def _connect_select_insert_commit(async_engine):
+    """A fixture that reads rows, then writes.  A SELECT whose cursor is
+    not closed keeps a read lock on the database; the write that follows
+    the cancellation is what finds it."""
+
+    async with async_engine.begin() as conn:
+        await conn.execute(text("select x from t"))
+        await conn.execute(text("insert into t (x) values (1)"))
 
 
 async def _connect_close_then_reuse(async_engine):
@@ -192,6 +203,38 @@ class AsyncCancellationTest(fixtures.TestBase):
         eq_(
             await cancellation.sweep(
                 failing_engine_factory, _connect_execute_except_exception
+            ),
+            [],
+        )
+
+    @testing.requires.sqlite_file
+    @async_test
+    async def test_cancel_anywhere_lock_released(self, async_testing_engine):
+        """the cursor of a cancelled execute() is closed, so that it does
+        not keep the database locked for the next connection.  Only sqlite
+        locks the whole database, and only a file database is shared between
+        connections."""
+
+        def engine_factory():
+            return async_testing_engine(
+                options={
+                    "poolclass": AsyncAdaptedQueuePool,
+                    "pool_size": 1,
+                    "max_overflow": 0,
+                    "pool_timeout": 1,
+                    "connect_args": {"timeout": 0.5},
+                }
+            )
+
+        async_engine = engine_factory()
+        async with async_engine.begin() as conn:
+            await conn.execute(text("create table if not exists t (x int)"))
+            await conn.execute(text("insert into t (x) values (1)"))
+        await async_engine.dispose()
+
+        eq_(
+            await cancellation.sweep(
+                engine_factory, _connect_select_insert_commit, warm=True
             ),
             [],
         )
